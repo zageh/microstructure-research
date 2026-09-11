@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Environment / secrets
+.env
+.env.*
+
+# Local/editor metadata
+.idea/
+.vscode/
+*:Zone.Identifier
+.DS_Store
+
+# Large or generated datasets
+data/raw/**
+data/external/**
+data/processed/**
+*.inprogress
+
+# Runtime output
+logs/
+*.log
