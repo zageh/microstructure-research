@@ -1,1 +1,2 @@
 websockets>=13,<17
+pandas>=2,<4

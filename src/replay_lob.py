@@ -16,7 +16,7 @@ import logging
 import sys
 import time
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal #将科学计数法转为具体数字
 from pathlib import Path
 from typing import Any, Iterator, TextIO
 
