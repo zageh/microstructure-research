@@ -4,11 +4,14 @@
 The default column names match Binance's headerless aggregate-trade CSV files.
 For a CSV that already has column names, pass ``--has-header``.  A headed file
 must contain ``timestamp``, ``price``, and ``quantity`` columns.
+Data is processed and written in batches of at most 1,000,000 rows; inspection
+and aggregation results describe each batch separately.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
 
@@ -17,6 +20,7 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROCESSED_DATA_DIRECTORY = PROJECT_ROOT / "data" / "processed"
+CHUNK_SIZE = 1_000_000
 
 # Binance aggregate-trade files do not include a header row.  Naming every
 # field here is clearer than working with integer column positions later.
@@ -37,31 +41,41 @@ def load_orders(
     *,
     has_header: bool = False,
     max_rows: int | None = None,
-) -> pd.DataFrame:
-    """Read an order/trade CSV and return it as a dataframe."""
+) -> Iterator[pd.DataFrame]:
+    """Read an order/trade CSV one bounded batch at a time."""
     if not input_file.is_file():
         raise FileNotFoundError(f"input file does not exist: {input_file}")
 
-    if has_header:
-        dataframe = pd.read_csv(input_file, nrows=max_rows)
-        dataframe.columns = [
-            str(column).strip().lower() for column in dataframe.columns
-        ]
-    else:
-        dataframe = pd.read_csv(input_file, header=None, nrows=max_rows)
-        if len(dataframe.columns) != len(RAW_COLUMN_NAMES):
-            raise ValueError(
-                "headerless CSV must have exactly "
-                f"{len(RAW_COLUMN_NAMES)} columns; found {len(dataframe.columns)}"
-            )
-        dataframe.columns = RAW_COLUMN_NAMES
+    with pd.read_csv(
+        input_file,
+        header="infer" if has_header else None,
+        nrows=max_rows,
+        chunksize=CHUNK_SIZE,
+    ) as reader:
+        # A zero-row limit should still validate columns and write a CSV header.
+        batches = [reader.read(nrows=0)] if max_rows == 0 else reader
+        for dataframe in batches:
+            if has_header:
+                dataframe.columns = [
+                    str(column).strip().lower() for column in dataframe.columns
+                ]
+            else:
+                if len(dataframe.columns) != len(RAW_COLUMN_NAMES):
+                    raise ValueError(
+                        "headerless CSV must have exactly "
+                        f"{len(RAW_COLUMN_NAMES)} columns; found {len(dataframe.columns)}"
+                    )
+                dataframe.columns = RAW_COLUMN_NAMES
 
-    missing_columns = REQUIRED_COLUMNS.difference(dataframe.columns)
-    if missing_columns:
-        missing = ", ".join(sorted(missing_columns))
-        raise ValueError(f"CSV is missing required columns: {missing}")
+            missing_columns = REQUIRED_COLUMNS.difference(dataframe.columns)
+            if missing_columns:
+                missing = ", ".join(sorted(missing_columns))
+                raise ValueError(f"CSV is missing required columns: {missing}")
 
-    return dataframe
+            yield dataframe
+            # Release the generator's reference before reading the next batch.
+            del dataframe
+
 
 def parse_timestamp(values: pd.Series, timestamp_unit: str) -> pd.Series:
     """Convert numeric epoch values or timestamp strings to UTC datetimes."""
@@ -202,15 +216,22 @@ def print_dataframe_inspection(dataframe: pd.DataFrame) -> None:
     print(dataframe.describe(include="all"))
 
 
-def save_cleaned_data(dataframe: pd.DataFrame, output_file: Path) -> None:
-    """Save a cleaned dataframe, creating the output directory if needed."""
+def save_cleaned_data(
+    dataframe: pd.DataFrame, output_file: Path, *, append: bool = False
+) -> None:
+    """Write a batch, including column names only for the first batch."""
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    dataframe.to_csv(output_file, index=False)
+    dataframe.to_csv(
+        output_file, index=False, mode="a" if append else "w", header=not append
+    )
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Load, clean, inspect, filter, and aggregate trade CSV data."
+        description=(
+            "Load, clean, inspect, filter, and aggregate trade CSV data "
+            "in batches of at most 1,000,000 rows. Statistics are per batch."
+        )
     )
     parser.add_argument("input_file", type=Path, help="CSV file to inspect")
     parser.add_argument(
@@ -256,33 +277,50 @@ def main() -> None:
         PROCESSED_DATA_DIRECTORY / f"{input_file.stem}_cleaned.csv"
     )
 
-    raw_orders = load_orders(
+    if input_file.resolve() == output_file.resolve() or (
+        output_file.exists() and input_file.samefile(output_file)
+    ):
+        raise ValueError("input and output CSV paths must be different")
+
+    total_read = 0
+    total_written = 0
+    batch_number = 0
+    batches = load_orders(
         input_file,
         has_header=args.has_header,
         max_rows=args.rows,
     )
-    cleaned_orders = clean_orders(raw_orders, timestamp_unit=args.timestamp_unit)
-    dropped_rows = len(raw_orders) - len(cleaned_orders)
+    for raw_orders in batches:
+        batch_number += 1
+        total_read += len(raw_orders)
+        cleaned_orders = clean_orders(raw_orders, timestamp_unit=args.timestamp_unit)
+        dropped_rows = len(raw_orders) - len(cleaned_orders)
+        del raw_orders
 
-    print_dataframe_inspection(cleaned_orders)
-    print(f"\nRows removed during cleaning: {dropped_rows}")
+        save_cleaned_data(cleaned_orders, output_file, append=batch_number > 1)
+        total_written += len(cleaned_orders)
+        print(f"\n=== Batch {batch_number}: saved {len(cleaned_orders)} rows ===")
+        print_dataframe_inspection(cleaned_orders)
+        print(f"\nRows removed during cleaning: {dropped_rows}")
 
-    filtered_orders = filter_orders(
-        cleaned_orders,
-        start=args.start,
-        end=args.end,
-        min_price=args.min_price,
-        max_price=args.max_price,
-        min_quantity=args.min_quantity,
-    )
+        filtered_orders = filter_orders(
+            cleaned_orders,
+            start=args.start,
+            end=args.end,
+            min_price=args.min_price,
+            max_price=args.max_price,
+            min_quantity=args.min_quantity,
+        )
+        del cleaned_orders
 
-    print("\n=== Aggregation for filtered records ===")
-    print(aggregate_orders(filtered_orders))
+        print("\n=== Aggregation for filtered records (current batch) ===")
+        print(aggregate_orders(filtered_orders))
 
-    print(f"\n=== Time aggregation ({args.interval}) ===")
-    print(group_orders_by_time(filtered_orders, interval=args.interval))
+        print(f"\n=== Time aggregation ({args.interval}, current batch) ===")
+        print(group_orders_by_time(filtered_orders, interval=args.interval))
+        del filtered_orders
 
-    save_cleaned_data(cleaned_orders, output_file)
+    print(f"\nTotal rows read: {total_read}; total rows written: {total_written}")
     print(f"\nCleaned data saved to: {output_file}")
 
 

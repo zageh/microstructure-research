@@ -3,7 +3,7 @@
 
 Input order is authoritative: every snapshot resets the local book, and each
 subsequent diff-depth event is checked before it is applied.  Reconstructed
-Top-N book states are written as JSONL to stdout or an optional gzip file.
+Top-N book states are written as gzip-compressed Parquet to stdout or a file.
 """
 
 from __future__ import annotations
@@ -20,7 +20,10 @@ from decimal import Decimal #将科学计数法转为具体数字
 from pathlib import Path
 from typing import Any, Iterator, TextIO
 
-from binance_lob import LocalOrderBook, SequenceGap, compact_json
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from binance_lob import LocalOrderBook, SequenceGap
 
 
 LOG = logging.getLogger("replay_lob")
@@ -130,19 +133,70 @@ class ReplayClock:
         self.previous_ns = received_at_ns
 
 
-class JsonlOutput:
-    """Write replay output, finalizing files atomically after a successful run."""
+PARQUET_SCHEMA = pa.schema(
+    [
+        pa.field("type", pa.string(), nullable=False),
+        pa.field("schema_version", pa.int32()),
+        pa.field("symbol", pa.string(), nullable=False),
+        pa.field("levels", pa.int32(), nullable=False),
+        pa.field("every_ms", pa.float64()),
+        pa.field("price_quantity_encoding", pa.string()),
+        pa.field("received_at_ns", pa.int64()),
+        pa.field("event_time_us", pa.int64()),
+        pa.field("trigger", pa.string()),
+        pa.field("last_update_id", pa.int64()),
+        pa.field("best_bid", pa.string()),
+        pa.field("best_ask", pa.string()),
+        pa.field("mid_price", pa.string()),
+        pa.field("spread", pa.string()),
+        pa.field("depth_imbalance", pa.string()),
+        pa.field(
+            "bids",
+            pa.list_(
+                pa.struct(
+                    [
+                        pa.field("price", pa.string(), nullable=False),
+                        pa.field("quantity", pa.string(), nullable=False),
+                    ]
+                )
+            ),
+        ),
+        pa.field(
+            "asks",
+            pa.list_(
+                pa.struct(
+                    [
+                        pa.field("price", pa.string(), nullable=False),
+                        pa.field("quantity", pa.string(), nullable=False),
+                    ]
+                )
+            ),
+        ),
+    ],
+    metadata={b"compression": b"gzip"},
+)
 
-    def __init__(self, path: Path | None, overwrite: bool) -> None:
+
+class ParquetOutput:
+    """Write gzip Parquet, finalizing files atomically after a successful run."""
+
+    ROW_GROUP_SIZE = 10_000
+
+    def __init__(self, path: Path | None, overwrite: bool, enabled: bool = True) -> None:
         self.path = path
         self.overwrite = overwrite
-        self.handle: TextIO | None = None
+        self.enabled = enabled
         self.temp_path: Path | None = None
-        self._owns_handle = False
+        self.writer: pq.ParquetWriter | None = None
+        self.records: list[dict[str, Any]] = []
 
-    def __enter__(self) -> "JsonlOutput":
+    def __enter__(self) -> "ParquetOutput":
+        if not self.enabled:
+            return self
         if self.path is None or str(self.path) == "-":
-            self.handle = sys.stdout
+            self.writer = pq.ParquetWriter(
+                sys.stdout.buffer, PARQUET_SCHEMA, compression="gzip"
+            )
             return self
 
         if self.path.exists() and not self.overwrite:
@@ -153,23 +207,43 @@ class JsonlOutput:
             raise ReplayError(
                 f"temporary output already exists (use --overwrite): {self.temp_path}"
             )
-        if self.path.name.endswith(".gz"):
-            self.handle = gzip.open(self.temp_path, mode="wt", encoding="utf-8")
-        else:
-            self.handle = self.temp_path.open(mode="wt", encoding="utf-8")
-        self._owns_handle = True
+        self.writer = pq.ParquetWriter(
+            self.temp_path, PARQUET_SCHEMA, compression="gzip"
+        )
         return self
 
     def write(self, record: dict[str, Any]) -> None:
-        if self.handle is None:
+        if self.writer is None:
             raise RuntimeError("output is not open")
-        self.handle.write(compact_json(record) + "\n")
+        normalized = dict(record)
+        for side in ("bids", "asks"):
+            if side in normalized:
+                normalized[side] = [
+                    {"price": price, "quantity": quantity}
+                    for price, quantity in normalized[side]
+                ]
+        self.records.append(normalized)
+        if len(self.records) >= self.ROW_GROUP_SIZE:
+            self._flush()
+
+    def _flush(self) -> None:
+        if not self.records:
+            return
+        if self.writer is None:
+            raise RuntimeError("output is not open")
+        table = pa.Table.from_pylist(self.records, schema=PARQUET_SCHEMA)
+        self.writer.write_table(table, row_group_size=self.ROW_GROUP_SIZE)
+        self.records.clear()
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
-        if not self._owns_handle or self.handle is None or self.temp_path is None:
+        if self.writer is None:
             return
-        self.handle.close()
-        if exc_type is None:
+        if exc_type is not None:
+            self.writer.close()
+            return
+        self._flush()
+        self.writer.close()
+        if self.temp_path is not None:
             self.temp_path.replace(str(self.path))
 
 
@@ -228,7 +302,7 @@ def make_state(
 
 
 class ReplayEngine:
-    def __init__(self, args: argparse.Namespace, output: JsonlOutput) -> None:
+    def __init__(self, args: argparse.Namespace, output: ParquetOutput) -> None:
         self.args = args
         self.output = output
         self.stats = ReplayStats()
@@ -366,10 +440,13 @@ class ReplayEngine:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Rebuild and replay Top-N LOB states from Binance gzip JSONL captures."
+        description=(
+            "Rebuild and replay Top-N LOB states from Binance gzip JSONL captures "
+            "into gzip-compressed Parquet."
+        )
     )
     parser.add_argument("inputs", nargs="+", type=Path, help="capture file(s) or directories")
-    parser.add_argument("-o", "--output", type=Path, help="JSONL path, optionally .gz; default stdout")
+    parser.add_argument("-o", "--output", type=Path, help="Parquet path; default stdout")
     parser.add_argument("--symbol", type=str.upper, help="expected symbol; otherwise read metadata")
     parser.add_argument("--levels", type=int, default=20, help="levels per side to emit")
     parser.add_argument(
@@ -429,7 +506,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         files = discover_inputs(args.inputs, args.include_inprogress)
-        with JsonlOutput(args.output, args.overwrite) as output:
+        with ParquetOutput(
+            args.output, args.overwrite, enabled=not args.validate_only
+        ) as output:
             stats = ReplayEngine(args, output).process_files(files)
     except BrokenPipeError:
         return 0
